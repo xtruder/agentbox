@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-brew=/home/linuxbrew/.linuxbrew/bin
-if [[ ! -x $brew/openchamber ]]; then
-  "$brew/npm" install --global @openchamber/web
-fi
+# node-pty provides OpenChamber's terminal; npm skips its native build
+# scripts unless they are allowed explicitly.
+/home/linuxbrew/.linuxbrew/bin/npm install --global --allow-scripts=node-pty @openchamber/web
