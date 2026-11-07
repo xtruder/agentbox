@@ -1,0 +1,5 @@
+[Unit]
+Description=agentbox X11 desktop session services
+# Started by the agentbox-session XDG autostart entry once DISPLAY and
+# XAUTHORITY are imported; Xfce does not activate graphical-session.target.
+Wants=hermes-browser.service x11vnc.service

@@ -1,0 +1,38 @@
+http:
+  routers:
+    hermes-gateway:
+      rule: "Host(`hermes-gateway.{{ .base_domain }}`)"
+      entryPoints:
+        - websecure
+      service: hermes-gateway-svc
+      tls:
+        certResolver: cloudflare
+
+    # Android app chat/sessions: Gateway API Server (8642) behind /gw path prefix.
+    # The app applies the prefix before /api and /v1 routes; /health lands at /gw/health.
+    hermes-gateway-api:
+      rule: "Host(`hermes-gateway.{{ .base_domain }}`) && PathPrefix(`/gw`)"
+      entryPoints:
+        - websecure
+      service: hermes-gateway-api-svc
+      middlewares:
+        - hermes-gw-strip
+      tls:
+        certResolver: cloudflare
+
+  services:
+    hermes-gateway-svc:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:9119"
+
+    hermes-gateway-api-svc:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8642"
+
+  middlewares:
+    hermes-gw-strip:
+      stripPrefix:
+        prefixes:
+          - "/gw"

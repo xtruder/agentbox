@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes WebUI
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=%h/.hermes/hermes-webui/start.sh
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h/.hermes/hermes-webui
+ExecStart=/bin/bash %h/.hermes/hermes-webui/start.sh --foreground --no-browser
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

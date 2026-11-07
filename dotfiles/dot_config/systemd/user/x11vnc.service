@@ -1,0 +1,12 @@
+[Unit]
+Description=VNC server for the autologin X11 display (xrdp backend)
+PartOf=agentbox-session.target
+ConditionPathExists=%h/.config/x11vnc/passwd
+
+[Service]
+Type=exec
+# Loopback only: xrdp on :3389 is the remote entry point.
+# x11vnc reads DISPLAY and XAUTHORITY imported by agentbox-session.desktop.
+ExecStart=/usr/bin/x11vnc -localhost -rfbport 5900 -rfbauth %h/.config/x11vnc/passwd -forever -shared -noxdamage -repeat -quiet
+Restart=on-failure
+RestartSec=5s

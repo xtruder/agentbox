@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Unit hashes:
+{{- range (glob (joinPath .chezmoi.sourceDir "dot_config/systemd/user/*")) }}
+# {{ base . }} {{ include . | sha256sum }}
+{{- end }}
+systemctl --user daemon-reload
+# Units whose configuration is not migrated yet are skipped by their
+# ConditionPathExists checks and start on the next boot or restart.
+systemctl --user enable --now \
+  hermes-serve.service \
+  hermes-webui.service \
+  openchamber.service \
+  personal-graph.service \
+  traefik.service

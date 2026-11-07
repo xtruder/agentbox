@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenChamber web server
+After=network-online.target
+Wants=network-online.target
+# startup.env carries OPENCHAMBER_UI_PASSWORD; never serve 0.0.0.0 without it.
+ConditionPathExists=%h/.config/openchamber/startup.env
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/openchamber/startup.env
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=OPENCODE_BINARY=/home/linuxbrew/.linuxbrew/bin/opencode
+WorkingDirectory=%h
+ExecStart=/home/linuxbrew/.linuxbrew/bin/openchamber serve --foreground --port 3000 --host 0.0.0.0
+Restart=always
+RestartSec=5
+# A graceful shutdown on SIGTERM exits 143; a stop is not a failure.
+SuccessExitStatus=143
+
+[Install]
+WantedBy=default.target

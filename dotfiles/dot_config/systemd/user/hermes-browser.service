@@ -1,0 +1,11 @@
+[Unit]
+Description=Hermes automation browser (Google Chrome, CDP on 127.0.0.1:9222)
+PartOf=agentbox-session.target
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/hermes-browser
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+Slice=app.slice

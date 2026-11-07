@@ -1,0 +1,21 @@
+[Unit]
+Description=Graph Next.js private notebook with live reload
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/graph/scripts/dev.ts
+
+[Service]
+Type=simple
+WorkingDirectory=%h/graph
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GRAPH_ORIGIN=https://graph.{{ .base_domain }}
+Environment=GRAPH_PORT=8791
+EnvironmentFile=-%h/.config/personal-graph.env
+ExecStart=/home/linuxbrew/.linuxbrew/bin/node %h/graph/scripts/dev.ts
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

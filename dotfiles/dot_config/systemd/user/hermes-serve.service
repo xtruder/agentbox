@@ -1,0 +1,13 @@
+[Unit]
+Description=Hermes Agent Serve Backend (remote gateway / dashboard API)
+After=network-online.target
+ConditionPathExists=%h/.local/bin/hermes
+
+[Service]
+ExecStart=%h/.local/bin/hermes serve --host 127.0.0.1 --port 9119
+Environment=HERMES_HOME=%h/.hermes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

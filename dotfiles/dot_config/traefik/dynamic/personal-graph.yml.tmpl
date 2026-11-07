@@ -1,0 +1,34 @@
+http:
+  routers:
+    personal-graph:
+      rule: "Host(`graph.{{ .base_domain }}`)"
+      entryPoints:
+        - websecure
+      service: personal-graph-svc
+      middlewares:
+        - personal-graph-private
+        - personal-graph-headers
+      tls:
+        certResolver: cloudflare
+  services:
+    personal-graph-svc:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8791"
+  middlewares:
+    # Tailnet and loopback only.
+    personal-graph-private:
+      ipAllowList:
+        sourceRange:
+          - "100.64.0.0/10"
+          - "fd7a:115c:a1e0::/48"
+          - "127.0.0.1/32"
+          - "::1/128"
+    personal-graph-headers:
+      headers:
+        contentTypeNosniff: true
+        frameDeny: true
+        referrerPolicy: no-referrer
+        customResponseHeaders:
+          X-Robots-Tag: "noindex, nofollow, noarchive"
+          Permissions-Policy: "camera=(), microphone=(), geolocation=()"

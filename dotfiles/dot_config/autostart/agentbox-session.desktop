@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=agentbox session services
+Comment=Start the Hermes browser and VNC server on this X11 session
+Exec=sh -c 'systemctl --user import-environment DISPLAY XAUTHORITY && exec systemctl --user start agentbox-session.target'
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

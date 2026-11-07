@@ -24,8 +24,14 @@ create:
       -c limits.memory="{{ memory }}" \
       -c boot.autostart=true \
       -c cloud-init.user-data="$(cat cloud-init/user-data.yaml)" \
-      -d root,pool="{{ pool }}",size="{{ disk_size }}"
+      -s "{{ pool }}" \
+      -d root,size="{{ disk_size }}"
     {{ incus }} start "{{ instance }}"
+    # Incus 7.5.1's agent reboots for cloud-init before reporting that it
+    # applied the image templates, so the host re-applies them on every boot
+    # and the VM loops. The first boot already has the rendered templates.
+    # Fixed upstream by lxc/incus@4e799f7287.
+    {{ incus }} config unset "{{ instance }}" volatile.apply_template
 
 # Wait for cloud-init, its reboot, and the autologin X11 session.
 wait:
