@@ -38,7 +38,15 @@ wait:
     #!/usr/bin/env bash
     set -euo pipefail
     deadline=$((SECONDS + {{ timeout }}))
-    until {{ incus }} exec "{{ instance }}" -- cloud-init status --wait >/dev/null 2>&1; do
+    while :; do
+      rc=0
+      {{ incus }} exec "{{ instance }}" -- cloud-init status --wait >/dev/null 2>&1 || rc=$?
+      # 0: done, 2: done with recoverable errors, 1: failed. Anything else
+      # means the agent is not reachable yet.
+      case $rc in
+        0|2) break ;;
+        1) echo 'cloud-init failed; see /var/log/cloud-init-output.log' >&2; exit 1 ;;
+      esac
       ((SECONDS < deadline)) || { echo 'cloud-init did not finish' >&2; exit 1; }
       sleep 10
     done
