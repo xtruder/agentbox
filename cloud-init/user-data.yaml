@@ -349,6 +349,7 @@ packages:
   - libsecret-tools
   - lightdm
   - lightdm-gtk-greeter
+  - nextcloud-desktop
   - openssh-server
   - sqlite3
   - tailscale
@@ -357,6 +358,13 @@ packages:
   - xubuntu-core
 
 write_files:
+  # jarvis' KVM/QEMU exposes CET user shadow stacks incorrectly to
+  # host-passthrough guests: systemd (PID 1) eventually page-faults on a call
+  # and the kernel panics with "Attempted to kill init! exitcode=0x0000000b".
+  - path: /etc/default/grub.d/90-agentbox.cfg
+    content: |
+      GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT nousershstk"
+
   - path: /etc/lightdm/lightdm.conf.d/50-agentbox.conf
     content: |
       [Seat:*]
@@ -419,6 +427,7 @@ write_files:
       #!/usr/bin/env bash
       set -euo pipefail
 
+      update-grub
       systemctl enable xrdp
       systemctl set-default graphical.target
       loginctl enable-linger agent

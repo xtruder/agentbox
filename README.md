@@ -16,7 +16,8 @@ this repository.
 | Xfce on X11, LightDM | apt (`xubuntu-core`) | Autologin for `agent` (UID 1000, passwordless sudo) |
 | GNOME Keyring | apt | `login` keyring with an empty password, so autologin never prompts |
 | Google Chrome | Google apt repository | `hermes-browser.service`, CDP on `127.0.0.1:9222` |
-| 1Password, `op` | 1Password apt repository | Sign in manually |
+| 1Password, `op` | 1Password apt repository | Autostarted; sign in or unlock manually |
+| Nextcloud desktop | apt | Autostarted; connect the account once, syncs `~/Nextcloud` |
 | Tailscale | Tailscale apt repository | Joined with `just tailscale-up` |
 | xrdp + x11vnc | apt | RDP on `:3389` shows the live autologin desktop |
 | Hermes Agent | upstream installer | Latest stable; `hermes update` owns upgrades; manages its own cua-driver |
@@ -68,6 +69,14 @@ To apply later changes to this repository inside the VM:
 just shell
 chezmoi update
 ```
+
+### CET shadow stacks
+
+The host's KVM/QEMU exposes CET user shadow stacks incorrectly to the
+host-passthrough guest CPU. systemd uses them and eventually page-faults as
+PID 1, panicking the kernel with `Attempted to kill init! exitcode=0x0000000b`.
+cloud-init adds `nousershstk` to the kernel command line through
+`/etc/default/grub.d/90-agentbox.cfg`.
 
 ### Incus 7.5.1 reboot loop
 
