@@ -3,9 +3,13 @@ Description=Hermes WebUI
 Wants=network-online.target
 After=network-online.target
 ConditionPathExists=%h/.hermes/hermes-webui/start.sh
+# Traefik publishes the WebUI, and without a password it serves sessions and
+# memory to anyone who can reach it.
+ConditionPathExists=%h/.config/hermes/webui.env
 
 [Service]
 Type=simple
+EnvironmentFile=%h/.config/hermes/webui.env
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=%h/.hermes/hermes-webui
 ExecStart=/bin/bash %h/.hermes/hermes-webui/start.sh --foreground --no-browser
