@@ -7,7 +7,8 @@ set -euo pipefail
 profile="$HOME/.hermes/chrome-cdp"
 mkdir -p "$profile"
 
-# The VM has no GPU; software rendering avoids GPU process failures.
+# The VM has no GPU. SwiftShader renders WebGL on the CPU; disabling the GPU
+# instead would leave pages without WebGL, a common bot-detection signal.
 exec /usr/bin/google-chrome-stable \
   --remote-debugging-address=127.0.0.1 \
   --remote-debugging-port=9222 \
@@ -16,5 +17,6 @@ exec /usr/bin/google-chrome-stable \
   --no-default-browser-check \
   --disable-blink-features=AutomationControlled \
   --password-store=gnome-libsecret \
-  --disable-gpu \
+  --use-angle=swiftshader \
+  --enable-unsafe-swiftshader \
   about:blank
