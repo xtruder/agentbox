@@ -1,0 +1,149 @@
+#cloud-config
+hostname: agentbox
+timezone: Europe/Ljubljana
+locale: en_US.UTF-8
+
+# Omitting the "default" entry keeps cloud-init from creating `ubuntu`, so
+# `agent` is the first regular account and receives UID 1000.
+users:
+  - name: agent
+    gecos: Agent
+    shell: /bin/bash
+    groups: [adm, sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBBn3XS9FgqskCni3d8LIw20+vUutFK6F8P2wcjZVMbDJLtzQO194hXjQoveEN7RZ8EdiJBjme3r3XdwwoMcNQUgMSpGiFtD2oG3zoApFJf6y7T5P25PdZyK+Tlb2YySCLQ==
+
+package_update: true
+package_upgrade: true
+packages:
+  - build-essential
+  - curl
+  - git
+  - gnome-keyring
+  - gpg
+  - jq
+  - libsecret-tools
+  - lightdm
+  - lightdm-gtk-greeter
+  - openssh-server
+  - sqlite3
+  - x11vnc
+  - xrdp
+  - xubuntu-core
+
+write_files:
+  - path: /etc/lightdm/lightdm.conf.d/50-agentbox.conf
+    content: |
+      [Seat:*]
+      autologin-user=agent
+      autologin-user-timeout=0
+      user-session=xfce
+
+  # Traefik runs as a user service and terminates TLS on :443.
+  - path: /etc/sysctl.d/60-agentbox-unprivileged-ports.conf
+    content: |
+      net.ipv4.ip_unprivileged_port_start=443
+
+  # xrdp only proxies to the x11vnc server on the autologin display, so RDP
+  # clients see the same desktop that Hermes automates instead of a second
+  # Xfce session for the same user.
+  - path: /etc/xrdp/xrdp.ini
+    defer: true
+    content: |
+      [Globals]
+      ini_version=1
+      fork=true
+      port=3389
+      security_layer=negotiate
+      crypt_level=high
+      certificate=
+      key_file=
+      ssl_protocols=TLSv1.2, TLSv1.3
+      autorun=agentbox
+      allow_channels=true
+      allow_multimon=false
+      bitmap_cache=true
+      bitmap_compression=true
+      max_bpp=32
+
+      [Logging]
+      LogFile=xrdp.log
+      LogLevel=INFO
+      EnableSyslog=true
+
+      [Channels]
+      rdpdr=true
+      rdpsnd=true
+      drdynvc=true
+      cliprdr=true
+      rail=false
+      xrdpvr=false
+
+      [agentbox]
+      name=agentbox desktop
+      lib=libvnc.so
+      username=na
+      password=ask
+      ip=127.0.0.1
+      port=5900
+
+  - path: /usr/local/libexec/agentbox-bootstrap
+    permissions: "0755"
+    defer: true
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      install -d -m 0755 /etc/apt/keyrings
+
+      curl -fsSL https://dl.google.com/linux/linux_signing_key.pub |
+        gpg --dearmor --yes -o /etc/apt/keyrings/google-chrome.gpg
+      echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main' \
+        > /etc/apt/sources.list.d/google-chrome.list
+
+      curl -fsSL https://downloads.1password.com/linux/keys/1password.asc |
+        gpg --dearmor --yes -o /etc/apt/keyrings/1password.gpg
+      echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/1password.gpg] https://downloads.1password.com/linux/debian/amd64 stable main' \
+        > /etc/apt/sources.list.d/1password.list
+      # 1Password packages are additionally verified with debsig.
+      install -d /etc/debsig/policies/AC2D62742012EA22 /usr/share/debsig/keyrings/AC2D62742012EA22
+      curl -fsSL https://downloads.1password.com/linux/debian/debsig/1password.pol \
+        -o /etc/debsig/policies/AC2D62742012EA22/1password.pol
+      curl -fsSL https://downloads.1password.com/linux/keys/1password.asc |
+        gpg --dearmor --yes -o /usr/share/debsig/keyrings/AC2D62742012EA22/debsig.gpg
+
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y google-chrome-stable 1password 1password-cli
+
+      # Joining the tailnet needs an auth key, so `just tailscale-up` does that
+      # from the host after provisioning.
+      curl -fsSL https://tailscale.com/install.sh | sh
+
+      systemctl enable xrdp
+      systemctl set-default graphical.target
+      loginctl enable-linger agent
+
+      runuser -u agent -- env HOME=/home/agent NONINTERACTIVE=1 bash -c \
+        "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      runuser -u agent -- /home/linuxbrew/.linuxbrew/bin/brew install chezmoi
+
+      # chezmoi's scripts enable user units, so they need the lingering user
+      # manager rather than a login session.
+      until [[ -S /run/user/1000/bus ]]; do sleep 1; done
+      runuser -u agent -- env \
+        HOME=/home/agent \
+        XDG_RUNTIME_DIR=/run/user/1000 \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+        PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin \
+        bash -c 'cd ~ && chezmoi init --apply https://github.com/xtruder/agentbox.git'
+
+runcmd:
+  - [/usr/local/libexec/agentbox-bootstrap]
+
+# The reboot applies the sysctl and package upgrades, and restarts the
+# autologin session with the dotfiles-provided autostart entries in place.
+power_state:
+  mode: reboot
+  condition: true

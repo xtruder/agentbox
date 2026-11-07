@@ -1,0 +1,4 @@
+brew "gh"
+brew "node"
+brew "opencode"
+brew "traefik"

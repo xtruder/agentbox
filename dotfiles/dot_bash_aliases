@@ -1,0 +1,6 @@
+# Sourced by Ubuntu's stock ~/.bashrc; keeps that file vanilla.
+eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
