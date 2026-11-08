@@ -103,6 +103,30 @@ live only in the VM:
 The WebUI, Traefik and OpenChamber units do not start until their files exist,
 so a fresh VM never serves these apps without authentication.
 
+## Hermes profiles
+
+- `default` runs everything locally in the VM and owns the messaging channels.
+- `coding` uses the SSH terminal backend, so its terminal and file tools run on
+  a development host. It has no messaging channels; use it from the WebUI
+  profile picker or with `hermes -p coding` (alias `coding`).
+
+The profile lives in Hermes state, not in this repository. To recreate it:
+
+```sh
+hermes profile create coding
+hermes -p coding config set model.provider opencode-go
+hermes -p coding config set model.default glm-5.3
+hermes -p coding config set terminal.backend ssh
+hermes -p coding config set terminal.cwd /home/offlinehq/Code
+# ~/.hermes/profiles/coding/.env: OPENCODE_GO_API_KEY, OPENROUTER_API_KEY and
+# TERMINAL_SSH_HOST=jarvis-dev.tail3a123.ts.net
+# TERMINAL_SSH_USER=offlinehq
+# TERMINAL_SSH_KEY=/home/agent/.ssh/id_ed25519
+```
+
+chezmoi generates `~/.ssh/id_ed25519` on first apply; append
+`~/.ssh/id_ed25519.pub` to the target user's `~/.ssh/authorized_keys`.
+
 ## Remote desktop
 
 Connect an RDP client to the VM's Tailscale address on port 3389 and enter the
