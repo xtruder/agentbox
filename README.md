@@ -107,8 +107,17 @@ so a fresh VM never serves these apps without authentication.
 
 - `default` runs everything locally in the VM and owns the messaging channels.
 - `coding` uses the SSH terminal backend, so its terminal and file tools run on
-  a development host. It has no messaging channels; use it from the WebUI
-  profile picker or with `hermes -p coding` (alias `coding`).
+  a development host. It has its own Discord bot and is also available from the
+  WebUI profile picker or with `hermes -p coding` (alias `coding`). Web search
+  (Exa) and the browser (agentbox Chrome over CDP) run on agentbox.
+
+The single `hermes-gateway.service` serves both profiles and their bots.
+
+The SSH backend uses `$HOME/.hermes` of the remote user as its sync directory:
+it pushes the profile's skills, credential files and caches there, and on
+session cleanup downloads that whole directory as a tar. The remote user must
+not have its own Hermes installation in `~/.hermes`, or every session copies
+it to agentbox.
 
 The profile lives in Hermes state, not in this repository. To recreate it:
 
@@ -118,7 +127,10 @@ hermes -p coding config set model.provider opencode-go
 hermes -p coding config set model.default glm-5.3
 hermes -p coding config set terminal.backend ssh
 hermes -p coding config set terminal.cwd /home/offlinehq/Code
-# ~/.hermes/profiles/coding/.env: OPENCODE_GO_API_KEY, OPENROUTER_API_KEY and
+hermes -p coding config set web.backend exa
+hermes -p coding config set browser.cdp_url ws://127.0.0.1:9222
+# ~/.hermes/profiles/coding/.env: OPENCODE_GO_API_KEY, OPENROUTER_API_KEY,
+# EXA_API_KEY, DISCORD_BOT_TOKEN, DISCORD_ALLOWED_USERS, DISCORD_HOME_CHANNEL and
 # TERMINAL_SSH_HOST=jarvis-dev.tail3a123.ts.net
 # TERMINAL_SSH_USER=offlinehq
 # TERMINAL_SSH_KEY=/home/agent/.ssh/id_ed25519

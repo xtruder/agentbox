@@ -25,6 +25,10 @@
 - 1Password and Nextcloud rewrite their own XDG autostart entries. Seed them
   with chezmoi `create_` files under the apps' own file names so chezmoi never
   overwrites or conflicts with the apps' copies.
+- Hermes' SSH terminal backend syncs `<remote $HOME>/.hermes` and downloads
+  all of it on session cleanup. Never point a profile at a remote user whose
+  `~/.hermes` holds a Hermes installation; it caused an 18 GB sync loop that
+  saturated the host's disks.
 - Let Hermes generate `hermes-gateway.service` (`hermes gateway install`); it
   embeds the managed runtime paths that change between Hermes releases.
 - Under `set -euo pipefail`, do not truncate an endless stream with `| head`;
