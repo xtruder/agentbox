@@ -372,6 +372,35 @@ write_files:
       autologin-user-timeout=0
       user-session=xfce
 
+  # Extends Ubuntu's security-only unattended-upgrades with -updates and the
+  # third-party repositories added above. 1Password's Release file has no
+  # usable Origin, so third-party repositories are matched by host.
+  - path: /etc/apt/apt.conf.d/52agentbox-unattended-upgrades
+    content: |
+      Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-updates";
+      Unattended-Upgrade::Origins-Pattern:: "site=dl.google.com";
+      Unattended-Upgrade::Origins-Pattern:: "site=downloads.1password.com";
+      Unattended-Upgrade::Origins-Pattern:: "site=pkgs.tailscale.com";
+      Unattended-Upgrade::Automatic-Reboot "true";
+      // The autologin session is always present.
+      Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "04:30";
+
+  # Upgrade at 04:00 so a required reboot happens at 04:30 the same night,
+  # before the Sunday 05:00 Hermes update.
+  - path: /etc/systemd/system/apt-daily.timer.d/agentbox.conf
+    content: |
+      [Timer]
+      OnCalendar=
+      OnCalendar=*-*-* 03,15:30
+      RandomizedDelaySec=10m
+  - path: /etc/systemd/system/apt-daily-upgrade.timer.d/agentbox.conf
+    content: |
+      [Timer]
+      OnCalendar=
+      OnCalendar=*-*-* 04:00
+      RandomizedDelaySec=10m
+
   # Traefik runs as a user service and terminates TLS on :443.
   - path: /etc/sysctl.d/60-agentbox-unprivileged-ports.conf
     content: |

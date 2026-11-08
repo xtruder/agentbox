@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Updates Hermes Agent (stable channel) and Hermes WebUI (latest release),
+# verifies the services, lets OpenCode attempt a repair when verification
+# fails, and rolls both back to the previous versions if that does not work.
+# Results are reported to the default profile's Discord home channel.
+set -euo pipefail
+
+hermes=$HOME/.local/bin/hermes
+agent_dir=$HOME/.hermes/hermes-agent
+webui_dir=$HOME/.hermes/hermes-webui
+state_dir=$HOME/.local/state/agentbox-update
+services=(hermes-gateway.service hermes-serve.service hermes-webui.service)
+opencode_model=opencode-go/glm-5.3
+
+install -d -m 0700 "$state_dir"
+exec 9>"$state_dir/lock"
+flock -n 9 || { echo 'another update is running'; exit 0; }
+
+run_id=$(date +%Y%m%dT%H%M%S)
+log=$state_dir/$run_id.log
+exec > >(tee -a "$log") 2>&1
+# Keep the last 20 runs.
+ls -1t "$state_dir"/*.log 2>/dev/null | tail -n +21 | xargs -r rm -f || true
+ls -1dt "$state_dir"/backup-* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true
+
+env_value() { sed -n "s/^$1=//p" "$HOME/.hermes/.env" | tail -n 1; }
+
+notify() {
+  "$hermes" send --to discord "$1" >/dev/null 2>&1 || echo "notify failed: $1"
+}
+
+health_once() {
+  local key
+  key=$(env_value API_SERVER_KEY)
+  systemctl --user is-active --quiet "${services[@]}" || { echo 'health: a service is not active'; return 1; }
+  # Gateway readiness plus every configured platform (both Discord bots and
+  # the API server) connected.
+  curl -fsS -m 10 -H "Authorization: Bearer $key" http://127.0.0.1:8642/health/detailed |
+    jq -e '.readiness.status == "ok"
+      and .readiness.checks.gateway.connected_platforms == .readiness.checks.gateway.platforms' >/dev/null ||
+    { echo 'health: gateway not ready or a platform is disconnected'; return 1; }
+  # The WebUI is published by Traefik and must refuse unauthenticated access.
+  [[ $(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:8787/api/sessions) == 401 ]] ||
+    { echo 'health: WebUI is down or not password protected'; return 1; }
+  [[ $(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:9119/) != 000 ]] ||
+    { echo 'health: hermes serve is not answering'; return 1; }
+}
+
+healthy() {
+  local deadline=$((SECONDS + 240))
+  until health_once; do
+    ((SECONDS < deadline)) || return 1
+    sleep 15
+  done
+  # One real agent turn proves the provider, config and tool loading work.
+  # Capture first: `| grep -q` would SIGPIPE hermes and fail under pipefail.
+  local reply
+  reply=$(timeout 240 "$hermes" chat -Q --oneshot -q 'Reply with exactly: ok' 2>&1) || true
+  grep -qx 'ok' <<<"$reply" || { echo "health: agent smoke test failed: ${reply:0:300}"; return 1; }
+}
+
+restart_services() {
+  systemctl --user restart "${services[@]}"
+}
+
+version_summary() {
+  printf 'agent %s, webui %s' \
+    "$(git -C "$agent_dir" describe --tags --always)" \
+    "$(git -C "$webui_dir" describe --tags --always)"
+}
+
+repair_with_opencode() {
+  echo "asking OpenCode ($opencode_model) to repair"
+  local prompt
+  prompt=$(cat <<EOF
+You are repairing a Hermes Agent installation on this Ubuntu VM after an
+automated update failed its health checks. Work non-interactively and finish
+within 25 minutes.
+
+Context:
+- Before: $before_summary. After: $(version_summary).
+- Hermes Agent checkout: $agent_dir (stable channel, managed by 'hermes update').
+- Hermes WebUI checkout: $webui_dir (pinned to a release tag).
+- User services: ${services[*]} (systemctl --user, journalctl --user -u NAME).
+- Hermes logs: ~/.hermes/logs/ and ~/.hermes/profiles/*/logs/.
+- Update log with the failing health check: $log
+- Health checks: all services active; GET http://127.0.0.1:8642/health/detailed
+  (Bearer API_SERVER_KEY from ~/.hermes/.env) reports readiness ok and all
+  platforms connected; WebUI /api/sessions returns 401; 127.0.0.1:9119
+  answers; 'hermes chat -Q --oneshot -q "Reply with exactly: ok"' prints ok.
+
+Rules:
+- Diagnose from logs first. Fix only what the update broke: missing
+  dependencies ('hermes pm install', 'hermes pm doctor'), config migrations
+  ('hermes config check', 'hermes config migrate'), or a WebUI start failure.
+- Never print, copy or rewrite secrets (.env, auth.json, mcp-tokens).
+- Do not change the update channel, switch branches, run 'hermes update
+  --channel', push to git, or edit files outside ~/.hermes and ~/.config.
+- Restart the user services after a fix and re-run the health checks.
+- End with a short plain-text summary of the cause and what you changed.
+EOF
+)
+  OPENCODE_API_KEY=$(env_value OPENCODE_GO_API_KEY) timeout 1800 \
+    opencode run --standalone --archived --auto -m "$opencode_model" \
+      --title "agentbox Hermes update repair $run_id" "$prompt" | tail -n 40 >"$state_dir/$run_id.opencode" || true
+  cat "$state_dir/$run_id.opencode"
+}
+
+rollback() {
+  echo "rolling back to $before_summary"
+  local backup=$state_dir/backup-$run_id
+  git -C "$agent_dir" checkout --quiet --detach "$before_agent"
+  # Sync Hermes' managed environment back to the old checkout's lockfile.
+  "$hermes" pm install
+  git -C "$webui_dir" checkout --quiet --detach "$before_webui"
+  (cd "$backup" && find . -type f -exec install -D -m 0600 {} "$HOME/.hermes/{}" \;)
+  restart_services
+}
+
+if ! health_once; then
+  notify "agentbox: skipped the Hermes update because the services were already unhealthy ($(version_summary)). Log: $log"
+  exit 1
+fi
+
+before_agent=$(git -C "$agent_dir" rev-parse HEAD)
+before_webui=$(git -C "$webui_dir" rev-parse HEAD)
+before_summary=$(version_summary)
+
+# Config migrations run during the update are not reversible by git.
+backup=$state_dir/backup-$run_id
+(cd "$HOME/.hermes" && find . -maxdepth 3 \( -name config.yaml -o -name .env \) \
+  -not -path './hermes-agent/*' -not -path './hermes-webui/*' -print0 |
+  xargs -0 -I{} install -D -m 0600 {} "$backup/{}")
+
+echo "updating from $before_summary"
+update_ok=true
+"$hermes" update --yes --no-gateway-restart || update_ok=false
+if $update_ok; then
+  webui_tag=$(curl -fsSL https://api.github.com/repos/nesquena/hermes-webui/releases/latest | jq -r .tag_name) &&
+    git -C "$webui_dir" fetch --quiet --tags --force origin &&
+    git -C "$webui_dir" checkout --quiet --detach "$webui_tag" || update_ok=false
+fi
+
+changed=true
+if [[ $(git -C "$agent_dir" rev-parse HEAD) == "$before_agent" &&
+      $(git -C "$webui_dir" rev-parse HEAD) == "$before_webui" ]]; then
+  changed=false
+fi
+if $update_ok && ! $changed; then
+  echo "already up to date ($before_summary)"
+  exit 0
+fi
+
+after_summary=$(version_summary)
+restart_services
+if $update_ok && healthy; then
+  notify "agentbox: updated Hermes: $before_summary → $after_summary."
+  exit 0
+fi
+# A failed update step that changed nothing (e.g. GitHub unreachable) needs
+# no repair or rollback, only a report.
+if ! $changed && healthy; then
+  notify "agentbox: the Hermes update step failed without changing anything ($before_summary). Log: $log"
+  exit 1
+fi
+
+repair_with_opencode
+restart_services
+if healthy; then
+  notify "agentbox: updated Hermes to $after_summary after an automatic repair. OpenCode summary: $(tail -n 8 "$state_dir/$run_id.opencode" | tr '\n' ' ' | cut -c1-1200)"
+  exit 0
+fi
+
+# Runs every step even if one fails; the health check decides the outcome.
+rollback || echo 'a rollback step failed'
+if healthy; then
+  notify "agentbox: Hermes update to $after_summary failed and was rolled back to $before_summary. Log: $log"
+else
+  notify "agentbox: Hermes update failed and the rollback to $before_summary is UNHEALTHY. Manual attention needed. Log: $log"
+fi
+exit 1

@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly Hermes Agent and WebUI update
+
+[Timer]
+# After the 04:00 unattended-upgrades run and its 04:30 reboot window.
+OnCalendar=Sun *-*-* 05:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
