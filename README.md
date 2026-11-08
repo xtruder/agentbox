@@ -139,6 +139,28 @@ hermes -p coding config set browser.cdp_url ws://127.0.0.1:9222
 chezmoi generates `~/.ssh/id_ed25519` on first apply; append
 `~/.ssh/id_ed25519.pub` to the target user's `~/.ssh/authorized_keys`.
 
+## Automatic updates
+
+- **Ubuntu**: unattended-upgrades installs security and `-updates` packages plus
+  Google Chrome, 1Password and Tailscale daily at 04:00
+  (`/etc/apt/apt.conf.d/52agentbox-unattended-upgrades`) and reboots at 04:30
+  when an update requires it.
+- **Hermes Agent and WebUI**: `agentbox-update-hermes.timer` runs
+  `~/.local/bin/agentbox-update-hermes` on Sundays at 05:00. It runs
+  `hermes update` on the stable channel and checks out the latest WebUI
+  release, restarts the services, and verifies them: gateway readiness with all
+  platforms connected, the WebUI rejecting unauthenticated requests, the serve
+  backend, and one real agent turn. If verification fails, OpenCode
+  (`opencode-go/glm-5.3`) gets one time-boxed repair attempt; if that fails too,
+  both are rolled back to the previous commits and configs. Every outcome is
+  posted to the default profile's Discord home channel, and logs are kept in
+  `~/.local/state/agentbox-update/`.
+
+The updater runs from systemd rather than Hermes cron because `hermes update`
+restarts the gateway that would be running the cron job.
+
+Run it manually with `systemctl --user start agentbox-update-hermes.service`.
+
 ## Remote desktop
 
 Connect an RDP client to the VM's Tailscale address on port 3389 and enter the

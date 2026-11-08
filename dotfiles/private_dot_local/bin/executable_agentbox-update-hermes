@@ -26,6 +26,7 @@ ls -1dt "$state_dir"/backup-* 2>/dev/null | tail -n +6 | xargs -r rm -rf || true
 env_value() { sed -n "s/^$1=//p" "$HOME/.hermes/.env" | tail -n 1; }
 
 notify() {
+  echo "$1"
   "$hermes" send --to discord "$1" >/dev/null 2>&1 || echo "notify failed: $1"
 }
 
