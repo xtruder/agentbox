@@ -22,6 +22,9 @@
   Install scripts must be idempotent and safe to rerun from `chezmoi update`.
   Hermes, the WebUI and OpenChamber install the latest release once; upgrades
   go through their own updaters.
+- 1Password and Nextcloud rewrite their own XDG autostart entries. Seed them
+  with chezmoi `create_` files under the apps' own file names so chezmoi never
+  overwrites or conflicts with the apps' copies.
 - Let Hermes generate `hermes-gateway.service` (`hermes gateway install`); it
   embeds the managed runtime paths that change between Hermes releases.
 - Under `set -euo pipefail`, do not truncate an endless stream with `| head`;

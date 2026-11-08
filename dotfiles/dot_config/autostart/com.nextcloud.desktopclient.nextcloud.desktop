@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Nextcloud
-Comment=Syncs ~/Nextcloud, used by the Hermes invoice job
-Exec=nextcloud --background
-Icon=Nextcloud
-Terminal=false
-X-GNOME-Autostart-enabled=true
