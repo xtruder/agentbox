@@ -8,6 +8,8 @@ set -euo pipefail
 hermes=$HOME/.local/bin/hermes
 agent_dir=$HOME/.hermes/hermes-agent
 webui_dir=$HOME/.hermes/hermes-webui
+# Local WebUI patches not yet upstream, re-applied on every release checkout.
+webui_patches=$HOME/.local/share/agentbox/patches/hermes-webui
 state_dir=$HOME/.local/state/agentbox-update
 services=(hermes-gateway.service hermes-serve.service hermes-webui.service)
 opencode_model=opencode-go/glm-5.3
@@ -107,6 +109,25 @@ EOF
   cat "$state_dir/$run_id.opencode"
 }
 
+# The release tag under any local patch commits.
+webui_release() { git -C "$webui_dir" describe --tags --abbrev=0 --match 'v*' HEAD; }
+
+# Returns 2 when the local patches no longer apply to the release.
+checkout_webui_release() {
+  local tag=$1 patches=()
+  git -C "$webui_dir" fetch --quiet --tags --force origin || return 1
+  git -C "$webui_dir" checkout --quiet --detach "$tag" || return 1
+  shopt -s nullglob
+  patches=("$webui_patches"/*.patch)
+  shopt -u nullglob
+  ((${#patches[@]})) || return 0
+  if ! git -C "$webui_dir" am --quiet --3way "${patches[@]}"; then
+    git -C "$webui_dir" am --abort || true
+    echo "local WebUI patches no longer apply to $tag"
+    return 2
+  fi
+}
+
 rollback() {
   echo "rolling back to $before_summary"
   local backup=$state_dir/backup-$run_id
@@ -125,6 +146,7 @@ fi
 
 before_agent=$(git -C "$agent_dir" rev-parse HEAD)
 before_webui=$(git -C "$webui_dir" rev-parse HEAD)
+before_webui_release=$(webui_release)
 before_summary=$(version_summary)
 
 # Config migrations run during the update are not reversible by git.
@@ -135,16 +157,26 @@ backup=$state_dir/backup-$run_id
 
 echo "updating from $before_summary"
 update_ok=true
+patch_failed=false
 "$hermes" update --yes --no-gateway-restart || update_ok=false
 if $update_ok; then
-  webui_tag=$(curl -fsSL https://api.github.com/repos/nesquena/hermes-webui/releases/latest | jq -r .tag_name) &&
-    git -C "$webui_dir" fetch --quiet --tags --force origin &&
-    git -C "$webui_dir" checkout --quiet --detach "$webui_tag" || update_ok=false
+  if webui_tag=$(curl -fsSL https://api.github.com/repos/nesquena/hermes-webui/releases/latest | jq -er .tag_name); then
+    if [[ $webui_tag != "$before_webui_release" ]]; then
+      checkout_webui_release "$webui_tag" || {
+        [[ $? == 2 ]] && patch_failed=true
+        update_ok=false
+      }
+    fi
+  else
+    update_ok=false
+  fi
 fi
 
+# Re-applied patches get new commit ids, so a WebUI change is judged by the
+# release tag underneath them.
 changed=true
 if [[ $(git -C "$agent_dir" rev-parse HEAD) == "$before_agent" &&
-      $(git -C "$webui_dir" rev-parse HEAD) == "$before_webui" ]]; then
+      $(webui_release) == "$before_webui_release" ]]; then
   changed=false
 fi
 if $update_ok && ! $changed; then
@@ -162,6 +194,18 @@ fi
 # no repair or rollback, only a report.
 if ! $changed && healthy; then
   notify "agentbox: the Hermes update step failed without changing anything ($before_summary). Log: $log"
+  exit 1
+fi
+
+# Porting local patches to a new release is a job for a human, not the
+# unattended repair: roll straight back and say so.
+if $patch_failed; then
+  rollback || echo 'a rollback step failed'
+  if healthy; then
+    notify "agentbox: kept $before_summary because the local WebUI patches in $webui_patches no longer apply to $webui_tag. Port them, then rerun the update."
+  else
+    notify "agentbox: the local WebUI patches no longer apply to $webui_tag and the rollback to $before_summary is UNHEALTHY. Manual attention needed. Log: $log"
+  fi
   exit 1
 fi
 

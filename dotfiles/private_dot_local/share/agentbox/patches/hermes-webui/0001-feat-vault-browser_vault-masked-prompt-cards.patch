@@ -1,0 +1,1135 @@
+From 1abf1c0e94b9c2d8211561f40bff90235ec908d0 Mon Sep 17 00:00:00 2001
+From: Jaka Hudoklin <jaka@x-truder.net>
+Date: Fri, 6 Nov 2026 13:36:18 +0100
+Subject: [PATCH] feat(vault): browser_vault masked prompt cards
+
+Unlock/save-login/2FA prompts from the browser vault now surface as masked
+cards in the WebUI chat instead of refusing with unlock_unavailable.
+Mirrors the clarify card flow: api/vault_prompts.py pending queue,
+/api/vault/pending + /api/vault/respond routes, per-turn unlock callbacks
+in streaming.py (tool threads inherit them), card markup/signals in
+messages.js plus i18n defaults. Credential answers travel only through the
+respond POST into the waiting entry; never journalled, logged or echoed.
+---
+ api/routes.py               |  66 +++++++
+ api/streaming.py            | 112 ++++++++++++
+ api/vault_prompts.py        | 196 +++++++++++++++++++++
+ static/i18n.js              |  15 ++
+ static/index.html           |  17 ++
+ static/messages.js          | 337 ++++++++++++++++++++++++++++++++++++
+ tests/test_vault_http.py    |  61 +++++++
+ tests/test_vault_prompts.py | 173 ++++++++++++++++++
+ 8 files changed, 977 insertions(+)
+ create mode 100644 api/vault_prompts.py
+ create mode 100644 tests/test_vault_http.py
+ create mode 100644 tests/test_vault_prompts.py
+
+diff --git a/api/routes.py b/api/routes.py
+index c64093d80..a43094b4c 100644
+--- a/api/routes.py
++++ b/api/routes.py
+@@ -12345,6 +12345,19 @@ def _session_attention_summary(session_id: str) -> dict | None:
+             "count": clarify_count,
+             "severity": "question",
+         }
++    try:
++        from api.vault_prompts import pending_count as get_vault_pending_count
++    except ImportError:
++        get_vault_pending_count = None
++    vault_count = int((get_vault_pending_count or (lambda *a, **k: 0))(session_id) or 0)
++    if vault_count > 0:
++        # Reuse the sidebar's "clarify" attention kind: a masked credential
++        # card is user-pending work in exactly the same category.
++        return {
++            "kind": "clarify",
++            "count": vault_count,
++            "severity": "question",
++        }
+     return None
+ 
+ 
+@@ -16280,6 +16293,9 @@ def handle_get(handler, parsed) -> bool:
+     if parsed.path == "/api/clarify/pending":
+         return _handle_clarify_pending(handler, parsed)
+ 
++    if parsed.path == "/api/vault/pending":
++        return _handle_vault_pending(handler, parsed)
++
+     if parsed.path == "/api/clarify/stream":
+         return _handle_clarify_sse_stream(handler, parsed)
+ 
+@@ -18742,6 +18758,10 @@ def handle_post(handler, parsed) -> bool:
+     if parsed.path == "/api/clarify/respond":
+         return _handle_clarify_respond(handler, body)
+ 
++    # ── Vault prompts (POST): browser_vault unlock / save-login / code answers ──
++    if parsed.path == "/api/vault/respond":
++        return _handle_vault_respond(handler, body)
++
+     # ── Commands (POST) ──
+     if parsed.path == "/api/commands/bundles/resolve":
+         from api.commands import resolve_bundle_command
+@@ -23860,6 +23880,19 @@ def _handle_clarify_pending(handler, parsed):
+     return j(handler, {"pending": None})
+ 
+ 
++def _handle_vault_pending(handler, parsed):
++    """Pending browser_vault prompt for a session (safe metadata only)."""
++    sid = parse_qs(parsed.query).get("session_id", [""])[0]
++    try:
++        from api.vault_prompts import get_pending as get_vault_pending
++    except ImportError:
++        return j(handler, {"pending": None})
++    pending = get_vault_pending(sid)
++    if pending:
++        return j(handler, {"pending": pending})
++    return j(handler, {"pending": None})
++
++
+ def _handle_clarify_sse_stream(handler, parsed):
+     """SSE endpoint for real-time clarify notifications.
+ 
+@@ -30891,6 +30924,39 @@ def _handle_clarify_respond(handler, body):
+     return j(handler, {"ok": True, "response": response})
+ 
+ 
++def _handle_vault_respond(handler, body):
++    """Deliver a vault-card answer to the waiting agent tool.
++
++    SECURITY: ``body["values"]`` carries the credential (master password,
++    one-time code, or identifier+password pair) typed into the masked card.
++    It is stored only on the pending entry inside the agent process and never
++    logged, journalled or echoed back — only ``ok``/``stale`` metadata is
++    returned to the browser.
++    """
++    sid = body.get("session_id", "")
++    if not sid:
++        return bad(handler, "session_id is required")
++    prompt_id = str(body.get("prompt_id", "")).strip()
++    if not prompt_id or len(prompt_id) > 64:
++        return bad(handler, "prompt_id is required")
++    values = body.get("values")
++    if not isinstance(values, dict):
++        values = {"response": body.get("response") or body.get("answer") or body.get("value") or ""}
++    values = {str(k)[:64]: str(v)[:4096] for k, v in values.items() if v is not None}
++    try:
++        from api.vault_prompts import respond_vault as respond_vault_prompt
++    except ImportError:
++        return bad(handler, "vault prompts not available", status=404)
++    ok = respond_vault_prompt(sid, prompt_id, values)
++    if not ok:
++        return j(handler, {
++            "ok": False,
++            "error": "Vault prompt expired or not found. The agent may have already proceeded.",
++            "stale": True,
++        }, status=409)
++    return j(handler, {"ok": True})
++
++
+ class _ManualCompressionMemoryHandler:
+     def __init__(self):
+         self.wfile = io.BytesIO()
+diff --git a/api/streaming.py b/api/streaming.py
+index 0d3b4cb62..ecf1d4c00 100644
+--- a/api/streaming.py
++++ b/api/streaming.py
+@@ -12850,6 +12850,99 @@ def _run_agent_streaming(
+         except ImportError:
+             logger.debug("Clarify module not available, falling back to polling")
+ 
++        # ── Vault prompts (browser_vault unlock / save-login / 2FA code) ──
++        # Registers the per-thread secrets callbacks on THIS agent thread so
++        # ``browser_vault`` can raise a masked prompt card in the browser
++        # instead of failing with ``unlock_unavailable``. Tool worker threads
++        # inherit the callbacks through hermes-agent's thread propagation.
++        # The values a user types travel only through the vault-respond POST
++        # into the pending entry and from there straight into
++        # ``agent.vault_backends`` — they are never logged or echoed.
++        _vault_registered = False
++        _unreg_vault_notify = None
++        _vault_unlock_cb = None
++        try:
++            from api.vault_prompts import (
++                register_gateway_notify as _reg_vault_notify,
++                unregister_gateway_notify as _unreg_vault_notify,
++                submit_pending as _submit_vault_pending,
++                respond_vault as _respond_vault_entry,
++            )
++            from agent.vault_backends import unlock as _vault_unlock_mod
++            import agent.vault_backends.unlock as _vault_times
++
++            _VAULT_UNLOCK_TIMEOUT_S = getattr(_vault_times, 'UNLOCK_TIMEOUT_S', 120)
++            _VAULT_SAVE_LOGIN_TIMEOUT_S = getattr(_vault_times, 'SAVE_LOGIN_TIMEOUT_S', 180)
++            _VAULT_CODE_TIMEOUT_S = getattr(_vault_times, 'CODE_TIMEOUT_S', 180)
++
++            def _vault_notify_cb(vault_data):
++                # Push the prompt card to the live chat stream. The frame only
++                # carries request metadata; a pending=None frame tells the
++                # browser a card can go away.
++                if vault_data:
++                    put('vault_prompt', {'session_id': session_id, 'pending': vault_data, 'pending_count': 1})
++
++            _reg_vault_notify(session_id, _vault_notify_cb)
++
++            def _ask_vault_card(kind, extra, timeout_s, cancel_evt):
++                data = {
++                    'kind': kind,
++                    'session_id': session_id,
++                    'requested_at': time.time(),
++                    'timeout_seconds': float(timeout_s or 0) or timeout_s,
++                    **(extra or {}),
++                }
++                entry = _submit_vault_pending(session_id, data)
++                deadline = time.monotonic() + max(float(data['timeout_seconds']), 1)
++                while True:
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        break
++                    if entry.event.wait(timeout=min(remaining, 0.25)):
++                        break
++                    if cancel_evt is not None and cancel_evt.is_set():
++                        break
++                if not entry.event.is_set():
++                    # Expiry / run-cancel: resolve the entry with no answer so
++                    # the queue never keeps a stale card after the tool gave up.
++                    try:
++                        _respond_vault_entry(session_id, entry.prompt_id, {})
++                    except Exception:
++                        pass
++                    return {}
++                return dict(entry.values or {})
++
++            def _vault_unlock_prompt(backend_name, display_name):
++                values = _ask_vault_card(
++                    'unlock',
++                    {'backend': str(backend_name or ''), 'display_name': str(display_name or '')},
++                    _VAULT_UNLOCK_TIMEOUT_S, cancel_event)
++                return str(values.get('password', ''))
++
++            def _vault_save_login_prompt(origin, site):
++                values = _ask_vault_card(
++                    'save_login',
++                    {'origin': str(origin or ''), 'label': str(site or '')},
++                    _VAULT_SAVE_LOGIN_TIMEOUT_S, cancel_event)
++                if values.get('password'):
++                    return {'identifier': str(values.get('identifier', '')),
++                            'password': str(values.get('password', ''))}
++                return None
++
++            def _vault_code_prompt(site, hint):
++                values = _ask_vault_card(
++                    'code',
++                    {'site': str(site or ''), 'hint': str(hint or '')},
++                    _VAULT_CODE_TIMEOUT_S, cancel_event)
++                return str(values.get('code', ''))
++
++            _vault_unlock_mod.set_unlock_prompt_callback(_vault_unlock_prompt)
++            _vault_unlock_mod.set_save_login_prompt_callback(_vault_save_login_prompt)
++            _vault_unlock_mod.set_code_prompt_callback(_vault_code_prompt)
++            _vault_registered = True
++        except Exception:
++            logger.debug("Vault prompt callbacks not available", exc_info=True)
++
+         def _clarify_ask_one(question, choices, sid, cancel_evt):
+             """Show one clarify card and wait for it.
+ 
+@@ -15965,6 +16058,25 @@ def _run_agent_streaming(
+                     _unreg_clarify_notify(session_id)
+                 except Exception:
+                     logger.debug("Failed to unregister clarify callback")
++            if _vault_registered:
++                try:
++                    from agent.vault_backends import unlock as _vault_cleanup_mod
++                    _vault_cleanup_mod.set_unlock_prompt_callback(None)
++                    _vault_cleanup_mod.set_save_login_prompt_callback(None)
++                    _vault_cleanup_mod.set_code_prompt_callback(None)
++                except Exception:
++                    logger.debug("Failed to clear vault prompts callbacks")
++                if _unreg_vault_notify is not None:
++                    try:
++                        _unreg_vault_notify(session_id)
++                    except Exception:
++                        logger.debug("Failed to unregister vault callback")
++                try:
++                    from api.vault_prompts import clear_pending as _clear_vault_pending_cleanup
++                    _clear_vault_pending_cleanup(session_id)
++                    put('vault_prompt', {'pending': None, 'pending_count': 0})
++                except Exception:
++                    logger.debug("Failed to clear pending vault prompts")
+             with _ENV_LOCK:
+                 for _key, _old_value in old_profile_env.items():
+                     if _old_value is None: os.environ.pop(_key, None)
+diff --git a/api/vault_prompts.py b/api/vault_prompts.py
+new file mode 100644
+index 000000000..e73ef57e7
+--- /dev/null
++++ b/api/vault_prompts.py
+@@ -0,0 +1,196 @@
++"""Vault prompt state for the WebUI.
++
++Mirrors the clarify flow structure (api/clarify.py), but the payload is a
++machine-intended credential answer for the browser vault (``browser_vault``):
++an unlock master password, a one-time code, or a save-login
++``{identifier, password}`` pair.
++
++SECURITY: the values a user types into the vault card are secrets. They are
++held only in the entry's ``values`` slot, passed straight to
++``agent.vault_backends.unlock`` inside the agent process, and must never be
++journalled, logged, echoed into the transcript, or included in SSE payloads.
++The pending card only ever carries the harmless request metadata (which
++manager, which site).
++
++Hermes Agent owns the prompt surface contract (per-thread
++``set_unlock_prompt_callback`` / ``set_save_login_prompt_callback`` /
++``set_code_prompt_callback``); api/streaming.py registers callbacks backed by
++this module for the duration of one agent turn.
++"""
++
++from __future__ import annotations
++
++import queue
++import threading
++import time
++import uuid
++from typing import Optional
++
++from api.session_events import publish_session_list_changed
++
++UNLOCK_TIMEOUT_SECONDS = 120
++SAVE_LOGIN_TIMEOUT_SECONDS = 180
++CODE_TIMEOUT_SECONDS = 180
++
++_lock = threading.Lock()
++_pending: dict[str, list] = {}
++
++_gateway_notify_cbs: dict[str, object] = {}
++
++_vault_sse_subscribers: dict[str, list] = {}
++
++
++def register_gateway_notify(session_key: str, cb) -> None:
++    """Register a per-session callback for pushing vault prompts to the UI."""
++    with _lock:
++        _gateway_notify_cbs[session_key] = cb
++
++
++def unregister_gateway_notify(session_key: str) -> None:
++    with _lock:
++        _gateway_notify_cbs.pop(session_key, None)
++
++
++def _current_notify_cb_locked(session_key: str):
++    return _gateway_notify_cbs.get(session_key)
++
++
++class _VaultEntry:
++    """One pending vault request: the values arrive via respond_vault()."""
++
++    __slots__ = ("event", "data", "values", "prompt_id")
++
++    def __init__(self, data: dict):
++        self.event = threading.Event()
++        self.data = dict(data)
++        self.prompt_id = str(data.get("prompt_id", "") or uuid.uuid4().hex[:12])
++        self.data["prompt_id"] = self.prompt_id
++        self.values: Optional[dict] = None
++
++
++def _vault_sse_notify(session_id: str, head: Optional[dict], total: int) -> None:
++    payload = {"pending": dict(head) if head else None, "pending_count": total}
++    for q in _vault_sse_subscribers.get(session_id, ()):
++        try:
++            q.put_nowait(payload)
++        except queue.Full:
++            pass  # drop if subscriber is slow; the poll fallback re-syncs
++
++
++def sse_subscribe(session_id: str) -> queue.Queue:
++    """Register a bounded Queue for SSE push to a given session."""
++    q: queue.Queue = queue.Queue(maxsize=16)
++    with _lock:
++        _vault_sse_subscribers.setdefault(session_id, []).append(q)
++    return q
++
++
++def sse_unsubscribe(session_id: str, q: queue.Queue) -> None:
++    """Remove a subscriber Queue; clean up empty session entries."""
++    with _lock:
++        subs = _vault_sse_subscribers.get(session_id)
++        if subs:
++            try:
++                subs.remove(q)
++            except ValueError:
++                pass
++            if not subs:
++                _vault_sse_subscribers.pop(session_id, None)
++
++
++def submit_pending(session_key: str, data: dict) -> _VaultEntry:
++    """Queue one pending vault request for a session and notify the UI."""
++    item = dict(data or {})
++    item["requested_at"] = float(item.get("requested_at") or time.time())
++    kind = str(item.get("kind") or "")
++    if kind == "save_login":
++        timeout = float(item.get("timeout_seconds") or SAVE_LOGIN_TIMEOUT_SECONDS)
++    elif kind == "code":
++        timeout = float(item.get("timeout_seconds") or CODE_TIMEOUT_SECONDS)
++    else:
++        timeout = float(item.get("timeout_seconds") or UNLOCK_TIMEOUT_SECONDS)
++    item["timeout_seconds"] = timeout
++    item["expires_at"] = item["requested_at"] + timeout
++    with _lock:
++        entry = _VaultEntry(item)
++        _pending.setdefault(session_key, []).append(entry)
++        head = _pending[session_key][0].data
++        _vault_sse_notify(session_key, dict(head), len(_pending[session_key]))
++        cb = _current_notify_cb_locked(session_key)
++    publish_session_list_changed("attention_pending")
++    if cb:
++        try:
++            cb(dict(entry.data))
++        except Exception:
++            pass
++    return entry
++
++
++def get_pending(session_key: str) -> Optional[dict]:
++    """Return the oldest pending vault request for this session, if any."""
++    with _lock:
++        items = _pending.get(session_key) or []
++        if items:
++            return dict(items[0].data)
++        return None
++
++
++def pending_count(session_key: str) -> int:
++    with _lock:
++        return len(_pending.get(session_key) or [])
++
++
++def _pop_locked(session_key: str, entry: _VaultEntry) -> None:
++    """Remove one entry from the pending queue; notify on the new head."""
++    items = _pending.get(session_key)
++    if not items:
++        return
++    try:
++        items.remove(entry)
++    except ValueError:
++        return
++    if items:
++        _vault_sse_notify(session_key, dict(items[0].data), len(items))
++    else:
++        _pending.pop(session_key, None)
++        _vault_sse_notify(session_key, None, 0)
++
++
++def respond_vault(session_key: str, prompt_id: str, values: dict) -> bool:
++    """Deliver the user's answer to one pending vault request.
++
++    ``values`` is the secret payload (e.g. ``{"password": ...}`` or
++    ``{"identifier": ..., "password": ...}``) and is stored only on the
++    entry; it never lands in journal or SSE state. Empty values are valid:
++    they resolve the entry with no answer (the user skipped the card).
++    """
++    with _lock:
++        items = _pending.get(session_key)
++        if not items:
++            return False
++        for entry in list(items):
++            if entry.prompt_id != prompt_id:
++                continue
++            _pop_locked(session_key, entry)
++            publish_session_list_changed("attention_resolved")
++            entry.values = dict(values or {})
++            entry.event.set()
++            return True
++    return False
++
++
++def clear_pending(session_key: str) -> int:
++    """Clear any pending vault requests for a session (run end / timeout).
++
++    Every entry resolves with an empty answer so a cancelled wait returns
++    immediately instead of hanging until its own timeout.
++    """
++    with _lock:
++        entries = _pending.pop(session_key, [])
++    _vault_sse_notify(session_key, None, 0)
++    if entries:
++        publish_session_list_changed("attention_cleared")
++    for entry in entries:
++        entry.values = {}
++        entry.event.set()
++    return len(entries)
+diff --git a/static/i18n.js b/static/i18n.js
+index 56791af0f..b5d96d3f1 100644
+--- a/static/i18n.js
++++ b/static/i18n.js
+@@ -184,6 +184,21 @@ const LOCALES = {
+     clarify_send: 'Send',
+     clarify_input_placeholder: 'Type your response…',
+     clarify_responding: 'Responding\u2026',
++    // Vault prompt card (browser_vault): masked credential answers
++    vault_heading_unlock: 'Password needed',
++    vault_heading_save: 'Save this login?',
++    vault_heading_code: 'Code needed',
++    vault_unlock_question: 'Unlock {0} for this session',
++    vault_save_question: 'Enter the login to save for this site',
++    vault_input_password_placeholder: 'Password — it never leaves this form',
++    vault_input_identifier_placeholder: 'Username',
++    vault_input_code_placeholder: 'One-time code',
++    vault_send: 'Use it',
++    vault_skip: 'Skip',
++    vault_skip_title: 'Skip — the agent will be told you declined',
++    vault_hint_unlock: 'The value is injected directly into the page — it never appears in the conversation.',
++    vault_hint_save: 'Stored in the local vault for this site only; the agent sees no secret.',
++    vault_hint_code: 'Enter the one-time code that was sent to you.',
+     session_attention_approval: (n) => n === 1 ? 'Approval' : `${n} approvals`,
+     session_attention_clarify: (n) => n === 1 ? 'Question' : `${n} questions`,
+     session_attention_generic: (n) => n === 1 ? 'Attention' : `${n} items`,
+diff --git a/static/index.html b/static/index.html
+index 5387277d0..2c4845846 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -541,6 +541,23 @@
+           <div class="clarify-hint" id="clarifyHint" data-i18n="clarify_hint">Pick a choice, or type your own answer below.</div>
+         </div>
+       </div>
++      <div class="clarify-card" id="vaultCard" role="dialog" aria-labelledby="vaultHeading" aria-describedby="vaultQuestion vaultHint" hidden aria-hidden="true" inert>
++        <div class="clarify-inner">
++          <div class="clarify-header">
++            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
++            <span id="vaultHeading" data-i18n="vault_heading_unlock">Password needed</span>
++            <span class="clarify-countdown" id="vaultCountdown"></span>
++            <button type="button" class="clarify-collapse" id="vaultSkip" aria-label="Skip vault prompt" data-i18n-aria-label="vault_skip" onclick="respondVault(null)" title="Skip (the agent will be told you declined)" data-i18n-title="vault_skip_title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
++          </div>
++          <div class="clarify-question" id="vaultQuestion"></div>
++          <div class="clarify-choices" id="vaultFields"></div>
++          <div class="clarify-response">
++            <input class="clarify-input" id="vaultPrimaryInput" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="vault_input_password_placeholder" placeholder="Type the password…">
++            <button class="clarify-submit" id="vaultSubmit" onclick="respondVault()" data-i18n="vault_send">Use it</button>
++          </div>
++          <div class="clarify-hint" id="vaultHint" data-i18n="vault_hint_unlock">The value is injected directly into the page — it never appears in the conversation.</div>
++        </div>
++      </div>
+       <div class="composer-terminal-panel" id="composerTerminalPanel" hidden>
+         <div class="composer-terminal-inner">
+           <div class="composer-terminal-resize-handle" id="terminalResizeHandle" role="separator" aria-orientation="horizontal" aria-label="Resize terminal" tabindex="0"></div>
+diff --git a/static/messages.js b/static/messages.js
+index 4f6060001..4916488f4 100644
+--- a/static/messages.js
++++ b/static/messages.js
+@@ -6367,6 +6367,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
+       // Browser notification is owned by showClarifyCard()/_notifyPromptCard().
+     });
+ 
++    source.addEventListener('vault_prompt',e=>{
++      let d={};
++      try{ d=JSON.parse(e.data||'{}'); }catch(_){ return; }
++      const sid=(d.session_id||_promptActiveSessionId());
++      if(sid!==_promptActiveSessionId()) return;
++      console.error('[vault] frame', JSON.stringify(d).slice(0,300));
++      if(typeof showToast==='function') showToast('[vault-debug] frame: '+(d.pending?('pending '+(d.pending.kind||'?')+' '+(d.pending.prompt_id||'')):'none'), 2500);
++      if(d.pending){ showVaultCard(d.pending); playAttentionSound(_attentionSoundKey(_promptActiveSessionId()||'','vault',1)); }
++      else { if(_vaultSessionId===sid) hideVaultCard(true,'resolved'); }
++    });
++
+     source.addEventListener('state_saved',e=>{
+       let d={};
+       try{ d=JSON.parse(e.data||'{}'); }catch(_){}
+@@ -9182,6 +9193,11 @@ function _hideClarifyCardIfOwner(sid, force=false, reason="dismissed") {
+   if (!sid || _clarifySessionId === sid) hideClarifyCard(force, reason);
+ }
+ 
++function _hideVaultCardIfOwner(sid, force=false, reason="dismissed") {
++  if (sid && _vaultSessionId && _vaultSessionId !== sid) return;
++  hideVaultCard(force, reason);
++}
++
+ function _renderPendingClarifyForActiveSession() {
+   const sid = _promptActiveSessionId();
+   if (!sid) return;
+@@ -9692,6 +9708,325 @@ var _clarifyEventSource = null;
+ var _clarifyFallbackTimer = null;
+ var _clarifyHealthTimer = null;
+ let _clarifyFallbackPollInFlight = false;
++
++// ── Vault prompt card (browser_vault unlock / save-login / 2FA code) ─────────
++// The card mirrors the clarify card visually (same .clarify-* classes) but the
++// answer is a credential: it is POSTed to /api/vault/respond and never pushed
++// into the conversation transcript, composer or draft storage.
++let _vaultSessionId = null;
++let _vaultPromptId = null;
++let _vaultKind = null;
++let _vaultSignature = '';
++let _vaultCountdownTimer = null;
++let _vaultExpiresAt = 0;
++let _vaultVisibleSince = 0;
++let _vaultPollInFlight = false;
++
++const VAULT_MIN_VISIBLE_MS = 600;
++
++function _vaultBelongsToActiveSession(sid) {
++  return sid === _promptActiveSessionId() || (!sid && !!_promptActiveSessionId());
++}
++
++function _hideVaultCardIfOwner(sid, force, reason) {
++  if (_vaultSessionId && sid && _vaultSessionId !== sid) return;
++  hideVaultCard(force === true, reason || 'session');
++}
++
++function _clearVaultCountdownTimer() {
++  if (_vaultCountdownTimer) { clearInterval(_vaultCountdownTimer); _vaultCountdownTimer = null; }
++}
++
++function _resetVaultCardState() {
++  _vaultSessionId = null;
++  _vaultPromptId = null;
++  _vaultKind = null;
++  _vaultSignature = '';
++  _vaultExpiresAt = 0;
++  _vaultVisibleSince = 0;
++}
++
++function _vaultSetControlsDisabled(disabled, loading = false) {
++  const inputs = [ 'vaultPrimaryInput', 'vaultIdentifierInput' ]
++    .map(id => $(id)).filter(Boolean);
++  inputs.forEach(inp => { inp.disabled = disabled; });
++  const submit = $("vaultSubmit");
++  if (submit) {
++    submit.disabled = disabled;
++    submit.classList.toggle("loading", !!loading);
++  }
++  const skip = $("vaultSkip");
++  if (skip) skip.disabled = disabled;
++}
++
++function _startVaultCountdown(pending) {
++  _clearVaultCountdownTimer();
++  const requestedAt = Number(pending.requested_at) || (Date.now() / 1000);
++  const timeout = Number(pending.timeout_seconds) || 0;
++  if (timeout <= 0) { $("vaultCountdown").textContent = ''; return; }
++  _vaultExpiresAt = (requestedAt + timeout) * 1000;
++  const el = $("vaultCountdown");
++  const tick = () => {
++    if (!el) return;
++    const remaining = Math.round((_vaultExpiresAt - Date.now()) / 1000);
++    if (remaining <= 0) {
++      el.textContent = '';
++      _clearVaultCountdownTimer();
++      if (_vaultSessionId && _vaultPromptId) hideVaultCard(true, 'expired');
++      return;
++    }
++    el.textContent = remaining >= 60
++      ? Math.floor(remaining / 60) + ':' + String(remaining % 60).padStart(2, '0')
++      : String(remaining) + 's';
++  };
++  tick();
++  _vaultCountdownTimer = setInterval(tick, 1000);
++}
++
++function _ensureVaultCardDom() {
++  let card = $("vaultCard");
++  if (card) return card;
++  const host = $("msgInner") || $("messages");
++  if (!host) return null;
++  card = document.createElement('div');
++  card.className = 'clarify-card';
++  card.id = 'vaultCard';
++  card.setAttribute('role', 'dialog');
++  card.setAttribute('aria-labelledby', 'vaultHeading');
++  card.setAttribute('aria-describedby', 'vaultQuestion vaultHint');
++  _setPromptFlyoutHidden(card, true);
++  card.innerHTML = `
++    <div class="clarify-inner">
++      <div class="clarify-header">
++        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
++        <span id="vaultHeading" data-i18n="vault_heading_unlock">Password needed</span>
++        <span class="clarify-countdown" id="vaultCountdown"></span>
++        <button type="button" class="clarify-collapse" id="vaultSkip" aria-label="Skip" data-i18n-title="vault_skip_title" title="Skip — the agent will be told you declined"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
++      </div>
++      <div class="clarify-question" id="vaultQuestion"></div>
++      <div class="clarify-choices" id="vaultFields"></div>
++      <div class="clarify-response">
++        <input class="clarify-input" id="vaultPrimaryInput" type="password" autocomplete="off" spellcheck="false" data-i18n-placeholder="vault_input_password_placeholder" placeholder="Type the password…">
++        <button class="clarify-submit" id="vaultSubmit" data-i18n="vault_send">Use it</button>
++      </div>
++      <div class="clarify-hint" id="vaultHint" data-i18n="vault_hint_unlock">The value is injected directly into the page — it never appears in the conversation.</div>
++    </div>
++  `;
++  host.appendChild(card);
++  const submit = $("vaultSubmit");
++  if (submit) submit.onclick = () => respondVault();
++  const skip = $("vaultSkip");
++  if (skip) skip.onclick = () => respondVault(null);
++  if (typeof applyLocaleToDOM === "function") applyLocaleToDOM();
++  return card;
++}
++
++function hideVaultCard(force = false, reason = "dismissed") {
++  const card = $("vaultCard");
++  const remaining = _vaultVisibleSince ? (VAULT_MIN_VISIBLE_MS - (Date.now() - _vaultVisibleSince)) : 0;
++  if (!force && reason !== 'expired' && remaining > 0 && card) {
++    setTimeout(() => hideVaultCard(true, reason), remaining);
++    return;
++  }
++  _clearVaultCountdownTimer();
++  _resetVaultCardState();
++  if (!card) return;
++  card.classList.remove("visible");
++  _setPromptFlyoutHidden(card, true);
++  $("vaultQuestion").textContent = "";
++  const fields = $("vaultFields");
++  if (fields) fields.innerHTML = '';
++  const primary = $("vaultPrimaryInput");
++  if (primary) { primary.value = ''; primary.disabled = false; }
++  const submit = $("vaultSubmit");
++  if (submit) { submit.disabled = false; submit.classList.remove("loading"); }
++  const skip = $("vaultSkip");
++  if (skip) skip.disabled = false;
++}
++
++function showVaultCard(pending) {
++  try {
++    _showVaultCardImpl(pending);
++  } catch (e) {
++    console.error('[vault] showVaultCard failed', e && e.stack || e);
++    if (typeof showToast === 'function') showToast('[vault-debug] ERROR: ' + String(e && e.message || e).slice(0, 160), 6000);
++  }
++}
++
++function _showVaultCardImpl(pending) {
++  if (!pending) return;
++  const sid = pending.session_id || (S.session && S.session.session_id) || '';
++  if (typeof _notifyPromptCard === 'function') _notifyPromptCard('vault', sid, pending);
++  if (!_vaultBelongsToActiveSession(sid)) {
++    console.error('[vault] showVaultCard skip: session mismatch', sid, 'active:', _promptActiveSessionId());
++    if (typeof showToast === 'function') showToast('[vault-debug] skip: session mismatch ' + sid + ' vs ' + _promptActiveSessionId(), 4000);
++    return;
++  }
++  const card = _ensureVaultCardDom();
++  if (!card) return;
++  const kind = String(pending.kind || 'unlock');
++  const sig = JSON.stringify({
++    kind,
++    pid: pending.prompt_id || null,
++    sid,
++    label: pending.label || pending.site || '',
++    display: pending.display_name || '',
++    hint: pending.hint || '',
++  });
++  const wasSame = card.classList.contains('visible') && _vaultSignature === sig;
++  _vaultSessionId = sid;
++  _vaultPromptId = pending.prompt_id || null;
++  _vaultKind = kind;
++  _vaultSignature = sig;
++  if (!wasSame) _vaultVisibleSince = Date.now();
++  const headingEl = $("vaultHeading");
++  const hintEl = $("vaultHint");
++  const questionEl = $("vaultQuestion");
++  const primary = $("vaultPrimaryInput");
++  const fields = $("vaultFields");
++  if (kind === 'save_login') {
++    if (headingEl) headingEl.setAttribute('data-i18n', 'vault_heading_save');
++    if (headingEl) headingEl.textContent = t('vault_heading_save') || 'Save this login?';
++    if (hintEl) { hintEl.setAttribute('data-i18n', 'vault_hint_save'); hintEl.textContent = t('vault_hint_save') || ''; }
++    if (primary) {
++      primary.setAttribute('data-i18n-placeholder', 'vault_input_password_placeholder');
++      primary.placeholder = t('vault_input_password_placeholder') || 'Password';
++    }
++    const target = pending.label || pending.origin || '';
++    if (questionEl) questionEl.textContent = (target ? target + ' — ' : '') + (t('vault_save_question') || 'Enter the login to save');
++    if (fields && !$('vaultIdentifierInput')) {
++      const wrap = document.createElement('div');
++      wrap.className = 'clarify-response';
++      const ident = document.createElement('input');
++      ident.className = 'clarify-input';
++      ident.id = 'vaultIdentifierInput';
++      ident.type = 'text';
++      ident.autocomplete = 'off';
++      ident.spellcheck = false;
++      ident.placeholder = t('vault_input_identifier_placeholder') || 'Username';
++      ident.setAttribute('data-i18n-placeholder', 'vault_input_identifier_placeholder');
++      ident.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); respondVault(); } };
++      wrap.appendChild(ident);
++      fields.innerHTML = '';
++      fields.appendChild(wrap);
++    }
++    if (ident) ident.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); respondVault(); } };
++  } else if (kind === 'code') {
++    if (headingEl) headingEl.setAttribute('data-i18n', 'vault_heading_code');
++    if (headingEl) headingEl.textContent = t('vault_heading_code') || 'Code needed';
++    if (hintEl) { hintEl.setAttribute('data-i18n', 'vault_hint_code'); hintEl.textContent = t('vault_hint_code') || ''; }
++    if (primary) {
++      primary.setAttribute('type', 'text');
++      primary.setAttribute('inputmode', 'numeric');
++      primary.setAttribute('data-i18n-placeholder', 'vault_input_code_placeholder');
++      primary.placeholder = t('vault_input_code_placeholder') || 'One-time code';
++    }
++    if (questionEl) questionEl.textContent = pending.site || pending.hint || '';
++    if (fields) fields.innerHTML = '';
++  } else {
++    if (headingEl) headingEl.setAttribute('data-i18n', 'vault_heading_unlock');
++    if (headingEl) headingEl.textContent = t('vault_heading_unlock') || 'Password needed';
++    if (hintEl) { hintEl.setAttribute('data-i18n', 'vault_hint_unlock'); hintEl.textContent = t('vault_hint_unlock') || ''; }
++    const manager = pending.display_name || pending.backend || '';
++    if (questionEl) questionEl.textContent = t('vault_unlock_question', manager);
++    if (primary) {
++      primary.setAttribute('type', 'password');
++      primary.removeAttribute('inputmode');
++      primary.setAttribute('data-i18n-placeholder', 'vault_input_password_placeholder');
++      primary.placeholder = t('vault_input_password_placeholder') || 'Master password';
++    }
++    if (fields) fields.innerHTML = '';
++  }
++  if (!wasSame && primary) primary.value = '';
++  if (primary) {
++    primary.disabled = false;
++    primary.autofocus = false;
++    primary.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); respondVault(); } };
++  }
++  if (Number(pending.timeout_seconds) > 0) {
++    _startVaultCountdown(pending);
++  } else {
++    _clearVaultCountdownTimer();
++  }
++  _setPromptFlyoutHidden(card, false);
++  card.classList.add('visible');
++  _vaultSetControlsDisabled(false, false);
++  if (typeof applyLocaleToDOM === 'function') applyLocaleToDOM();
++  if (!wasSame && primary && document.activeElement !== $('msg')) {
++    try { primary.focus({ preventScroll: true }); } catch (_) { primary.focus(); }
++  }
++}
++
++async function respondVault(skipRequested) {
++  const sid = _vaultSessionId || (S.session && S.session.session_id);
++  if (!sid) return;
++  const promptId = _vaultPromptId;
++  const kind = _vaultKind;
++  if (!promptId) return;
++  const primary = $("vaultPrimaryInput");
++  const ident = $("vaultIdentifierInput");
++  let values = {};
++  if (!skipRequested) {
++    if (kind === 'save_login') {
++      const p = (primary && primary.value || '').trim();
++      const i = (ident && ident.value || '').trim();
++      if (!p) { if (primary) primary.focus(); return; }
++      values = { identifier: i, password: p };
++    } else if (kind === 'code') {
++      const c = (primary && primary.value || '').trim().replace(/\s+/g, '');
++      if (!c) { if (primary) primary.focus(); return; }
++      values = { code: c };
++    } else {
++      const p = (primary && primary.value || '').trim();
++      if (!p) { if (primary) primary.focus(); return; }
++      values = { password: p };
++    }
++  }
++  _vaultSetControlsDisabled(true, !skipRequested);
++  try {
++    await api("/api/vault/respond", {
++      method: "POST",
++      body: JSON.stringify({ session_id: sid, prompt_id: promptId, values })
++    });
++    // Success or stale never echoes the value back; the card just resolves.
++    if (_vaultPromptId === promptId) {
++      hideVaultCard(true, 'sent');
++    }
++  } catch (e) {
++    const status = e && typeof e.status === 'number' ? e.status : null;
++    if (status === 409) {
++      if (_vaultPromptId === promptId) hideVaultCard(true, 'expired');
++    } else {
++      // Transient: restore controls so the user can retry. The typed value
++      // stays only in the masked input, never in drafts or messages.
++      _vaultSetControlsDisabled(false, false);
++      if (typeof setStatus === 'function' && e && e.message) setStatus('Vault: ' + e.message);
++    }
++  }
++}
++
++function _vaultPollTick(sid) {
++  if (!S.session || S.session.session_id !== sid) {
++    _hideVaultCardIfOwner(sid, true, 'session');
++    return;
++  }
++  if (_vaultPollInFlight) return;
++  _vaultPollInFlight = true;
++  (async () => {
++    try {
++      const data = await api("/api/vault/pending?session_id=" + encodeURIComponent(sid), { timeoutToast: false });
++      if (!S.session || S.session.session_id !== sid) return;
++      if (data && data.pending) { showVaultCard(data.pending); }
++      else { _hideVaultCardIfOwner(sid, false, 'expired'); }
++    } catch (e) {
++      // Vault cards are best-effort live region: the chat-stream event and the
++      // run-end clear cover the normal paths; poll errors stay silent.
++    } finally {
++      _vaultPollInFlight = false;
++    }
++  })();
++}
++
+ let _clarifyPollingSessionId = null;
+ let _clarifyProfilePausedSessionId = null;
+ 
+@@ -9727,6 +10062,8 @@ function _startClarifyFallbackPoll(sid) {
+     if (_clarifyFallbackPollInFlight) return;
+     _clarifyFallbackPollInFlight = true;
+     const focusEpoch = _promptPollerFocusEpoch;
++    // Pending browser_vault cards ride the same poll cadence (best effort).
++    if (typeof _vaultPollTick === 'function') _vaultPollTick(sid);
+     try {
+       const generation = _clarifyPromptGeneration(sid);
+       const data = await api("/api/clarify/pending?session_id=" + encodeURIComponent(sid),{timeoutToast:false});
+diff --git a/tests/test_vault_http.py b/tests/test_vault_http.py
+new file mode 100644
+index 000000000..c2ab4bbc3
+--- /dev/null
++++ b/tests/test_vault_http.py
+@@ -0,0 +1,61 @@
++"""HTTP-level tests for the vault prompt endpoints on the test server.
++
++Covers route wiring on a real server boot:
++  - GET /api/vault/pending returns {"pending": None} on an empty session
++  - POST /api/vault/respond rejects malformed requests (missing session/prompt_id)
++  - POST /api/vault/respond to an unknown prompt returns 409 + stale
++"""
++
++import json
++import urllib.error
++import urllib.request
++
++import pytest
++
++pytestmark = pytest.mark.usefixtures("test_server")
++
++
++def _get(base_url, path):
++    with urllib.request.urlopen(base_url + path, timeout=10) as r:
++        return json.loads(r.read())
++
++
++def _post(base_url, path, body):
++    """POST and return (status, parsed-body) for success and error replies."""
++    req = urllib.request.Request(
++        base_url + path,
++        data=json.dumps(body).encode(),
++        headers={"Content-Type": "application/json"},
++        method="POST",
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=10) as r:
++            return r.status, json.loads(r.read())
++    except urllib.error.HTTPError as e:
++        return e.code, json.loads(e.read())
++
++
++def test_vault_pending_empty(base_url):
++    data = _get(base_url, "/api/vault/pending?session_id=nonexistent-session")
++    assert data == {"pending": None}
++
++
++def test_vault_respond_requires_session(base_url):
++    status, body = _post(base_url, "/api/vault/respond", {"prompt_id": "abc"})
++    assert status == 400
++    assert "session_id is required" in body.get("error", "")
++
++
++def test_vault_respond_requires_prompt_id(base_url):
++    status, body = _post(base_url, "/api/vault/respond", {"session_id": "s", "prompt_id": ""})
++    assert status == 400
++    assert "prompt_id is required" in body.get("error", "")
++
++
++def test_vault_respond_unknown_prompt_is_stale_409(base_url):
++    status, body = _post(base_url, "/api/vault/respond", {
++        "session_id": "ghost-session", "prompt_id": "deadbeef",
++        "values": {"password": "x"}})
++    assert status == 409
++    assert body.get("ok") is False
++    assert body.get("stale") is True
+diff --git a/tests/test_vault_prompts.py b/tests/test_vault_prompts.py
+new file mode 100644
+index 000000000..6a6f13285
+--- /dev/null
++++ b/tests/test_vault_prompts.py
+@@ -0,0 +1,173 @@
++"""Tests for vault prompts (browser_vault masked cards).
++
++Mirrors tests/test_clarify_sse.py structure:
++  - Static analysis of backend and frontend code
++  - Unit tests for the pending queue lifecycle
++  - SECURITY assertions: values never reach SSE payloads, polls, or logs
++"""
++
++import os
++import threading
++import time
++
++import pytest
++
++# ── Paths ────────────────────────────────────────────────────────────────────
++_ROUTES = os.path.join(os.path.dirname(__file__), "..", "api", "routes.py")
++_STREAMING = os.path.join(os.path.dirname(__file__), "..", "api", "streaming.py")
++_MESSAGES = os.path.join(os.path.dirname(__file__), "..", "static", "messages.js")
++_INDEX = os.path.join(os.path.dirname(__file__), "..", "static", "index.html")
++_I18N = os.path.join(os.path.dirname(__file__), "..", "static", "i18n.js")
++
++sys_path = os.path.join(os.path.dirname(__file__), "..")
++
++import sys
++if sys_path not in sys.path:
++    sys.path.insert(0, sys_path)
++
++
++def _read(path):
++    with open(path) as f:
++        return f.read()
++
++
++def _fresh_vault_prompts():
++    """Import workspace module state fresh per test (module globals mutate)."""
++    import importlib
++    import api.vault_prompts as vp
++    importlib.reload(vp)
++    return vp
++
++
++# ══════════════════════════════════════════════════════════════════════════════
++# 1. Static analysis
++# ══════════════════════════════════════════════════════════════════════════════
++class TestVaultStaticMarkers:
++    def test_module_exists_with_core_functions(self):
++        src = _read(os.path.join(sys_path, "api", "vault_prompts.py"))
++        for marker in ("def submit_pending", "def respond_vault", "def clear_pending",
++                       "def register_gateway_notify", "class _VaultEntry"):
++            assert marker in src, f"api/vault_prompts.py missing: {marker}"
++
++    def test_routes_registered(self):
++        src = _read(_ROUTES)
++        assert '"/api/vault/pending"' in src
++        assert '"/api/vault/respond"' in src
++        assert "_handle_vault_respond" in src
++
++    def test_streaming_registers_unlock_callbacks(self):
++        src = _read(_STREAMING)
++        assert "set_unlock_prompt_callback" in src
++        assert "set_save_login_prompt_callback" in src
++        assert "set_code_prompt_callback" in src
++
++    def test_frontend_card_present(self):
++        src = _read(_MESSAGES)
++        assert "function showVaultCard" in src
++        assert "/api/vault/respond" in src
++        assert 'type="password"' in _read(_INDEX) and "vaultCard" in _read(_INDEX)
++
++    def test_i18n_keys_present(self):
++        src = _read(_I18N)
++        assert "vault_heading_unlock" in src
++        assert "vault_hint_unlock" in src
++
++    def test_vault_values_never_echoed_to_transcript(self):
++        """The respond success path must not push the answer into messages."""
++        src = _read(_MESSAGES)
++        vault_idx = src.index("async function respondVault")
++        end = src.index("function _vaultPollTick", vault_idx)
++        vault_block = src[vault_idx:end]
++        assert "S.messages.push" not in vault_block
++        assert "_stashClarifyDraft" not in vault_block
++
++    def test_backend_never_returns_values_to_browser(self):
++        """The respond handler must only return ok/stale metadata."""
++        src = _read(_ROUTES)
++        start = src.index("def _handle_vault_respond")
++        end = src.index("\nclass _ManualCompressionMemoryHandler", start)
++        block = src[start:end]
++        # The success reply is exactly {"ok": True}: no echo of the values.
++        assert 'return j(handler, {"ok": True})' in block
++        assert 'return j(handler, {"ok": True, ' not in block
++
++
++# ══════════════════════════════════════════════════════════════════════════════
++# 2. Unit tests — pending queue lifecycle
++# ══════════════════════════════════════════════════════════════════════════════
++class TestVaultQueueLifecycle:
++    def test_submit_then_respond_unblocks_waiter(self):
++        vp = _fresh_vault_prompts()
++        notified = []
++        vp.register_gateway_notify("s1", lambda data: notified.append(data))
++        try:
++            entry = vp.submit_pending("s1", {"kind": "unlock", "display_name": "1Password"})
++            assert notified, "submit must notify the UI callback"
++            assert notified[0].get("display_name") == "1Password"
++            assert "password" not in notified[0], "no secrets in the card payload"
++
++            result = {}
++
++            def waiter():
++                entry.event.wait(timeout=2)
++                result["values"] = dict(entry.values or {})
++
++            t = threading.Thread(target=waiter)
++            t.start()
++            assert vp.respond_vault("s1", entry.prompt_id, {"password": "hunter2"})
++            t.join(timeout=3)
++            assert result["values"].get("password") == "hunter2"
++            assert vp.get_pending("s1") is None
++            assert vp.pending_count("s1") == 0
++        finally:
++            vp.unregister_gateway_notify("s1")
++            vp.clear_pending("s1")
++
++    def test_respond_unknown_prompt_is_stale(self):
++        vp = _fresh_vault_prompts()
++        assert vp.respond_vault("none", "nope", {"password": "x"}) is False
++
++    def test_clear_pending_resolves_take_down_sse(self):
++        vp = _fresh_vault_prompts()
++        q = vp.sse_subscribe("s2")
++        try:
++            entry = vp.submit_pending("s2", {"kind": "unlock"})
++            assert vp.get_pending("s2") is not None
++            assert vp.clear_pending("s2") == 1
++            assert entry.event.is_set()
++            assert vp.get_pending("s2") is None
++            # Drain to the take-down notify (submit's event arrived first).
++            last = None
++            while True:
++                try:
++                    last = q.get_nowait()
++                except Exception:
++                    break
++            assert last == {"pending": None, "pending_count": 0}
++        finally:
++            vp.sse_unsubscribe("s2", q)
++            vp.clear_pending("s2")
++
++    def test_queue_maps_two_prompts_fifo(self):
++        vp = _fresh_vault_prompts()
++        try:
++            a = vp.submit_pending("s3", {"kind": "unlock", "display_name": "A"})
++            b = vp.submit_pending("s3", {"kind": "code", "site": "B"})
++            assert vp.get_pending("s3").get("display_name") == "A"
++            assert vp.respond_vault("s3", a.prompt_id, {"password": "p"})
++            head = vp.get_pending("s3")
++            assert head.get("site") == "B"
++            assert b.prompt_id != a.prompt_id
++        finally:
++            vp.clear_pending("s3")
++
++    def test_card_payload_has_no_ttl_leak_of_key_material(self):
++        """Pending card data carries metadata only."""
++        vp = _fresh_vault_prompts()
++        try:
++            entry = vp.submit_pending("s4", {"kind": "save_login", "label": "Example", "origin": "https://example.com"})
++            data = vp.get_pending("s4")
++            assert data["prompt_id"] == entry.prompt_id
++            assert "values" not in data
++        finally:
++            vp.clear_pending("s4")
+-- 
+2.56.0
+
