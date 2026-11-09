@@ -1,4 +1,4 @@
-From c797db69ea1dbd84323fd602425702c294bd1931 Mon Sep 17 00:00:00 2001
+From 65e2f3da5eca2e195d59ede51e30bf06909fee31 Mon Sep 17 00:00:00 2001
 From: Jaka Hudoklin <jaka@x-truder.net>
 Date: Fri, 6 Nov 2026 13:36:18 +0100
 Subject: [PATCH] feat(vault): browser_vault masked prompt cards
@@ -11,16 +11,18 @@ in streaming.py (tool threads inherit them), card markup/signals in
 messages.js plus i18n defaults. Credential answers travel only through the
 respond POST into the waiting entry; never journalled, logged or echoed.
 ---
- api/routes.py               |  66 +++++++
- api/streaming.py            | 112 ++++++++++++
- api/vault_prompts.py        | 196 +++++++++++++++++++++
- static/i18n.js              | 211 +++++++++++++++++++++++
- static/index.html           |  17 ++
- static/messages.js          | 332 ++++++++++++++++++++++++++++++++++++
- tests/test_vault_http.py    |  61 +++++++
- tests/test_vault_prompts.py | 173 +++++++++++++++++++
- 8 files changed, 1168 insertions(+)
+ api/routes.py                   |  66 +++++++
+ api/streaming.py                | 112 +++++++++++
+ api/vault_prompts.py            | 196 +++++++++++++++++++
+ static/i18n.js                  | 211 +++++++++++++++++++++
+ static/index.html               |  17 ++
+ static/messages.js              | 324 ++++++++++++++++++++++++++++++++
+ tests/test_vault_card_render.py | 110 +++++++++++
+ tests/test_vault_http.py        |  61 ++++++
+ tests/test_vault_prompts.py     | 173 +++++++++++++++++
+ 9 files changed, 1270 insertions(+)
  create mode 100644 api/vault_prompts.py
+ create mode 100644 tests/test_vault_card_render.py
  create mode 100644 tests/test_vault_http.py
  create mode 100644 tests/test_vault_prompts.py
 
@@ -810,10 +812,10 @@ index 902b2843e..48768a242 100644
          <div class="composer-terminal-inner">
            <div class="composer-terminal-resize-handle" id="terminalResizeHandle" role="separator" aria-orientation="horizontal" aria-label="Resize terminal" tabindex="0"></div>
 diff --git a/static/messages.js b/static/messages.js
-index a13d7acc5..c9b100dfb 100644
+index a13d7acc5..a19fe5298 100644
 --- a/static/messages.js
 +++ b/static/messages.js
-@@ -6770,6 +6770,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
+@@ -6770,6 +6770,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
        // Browser notification is owned by showClarifyCard()/_notifyPromptCard().
      });
  
@@ -822,8 +824,6 @@ index a13d7acc5..c9b100dfb 100644
 +      try{ d=JSON.parse(e.data||'{}'); }catch(_){ return; }
 +      const sid=(d.session_id||_promptActiveSessionId());
 +      if(sid!==_promptActiveSessionId()) return;
-+      console.error('[vault] frame', JSON.stringify(d).slice(0,300));
-+      if(typeof showToast==='function') showToast('[vault-debug] frame: '+(d.pending?('pending '+(d.pending.kind||'?')+' '+(d.pending.prompt_id||'')):'none'), 2500);
 +      if(d.pending){ showVaultCard(d.pending); playAttentionSound(_attentionSoundKey(_promptActiveSessionId()||'','vault',1)); }
 +      else { if(_vaultSessionId===sid) hideVaultCard(true,'resolved'); }
 +    });
@@ -831,7 +831,7 @@ index a13d7acc5..c9b100dfb 100644
      source.addEventListener('state_saved',e=>{
        let d={};
        try{ d=JSON.parse(e.data||'{}'); }catch(_){}
-@@ -10405,6 +10416,325 @@ var _clarifyEventSource = null;
+@@ -10405,6 +10414,319 @@ var _clarifyEventSource = null;
  var _clarifyFallbackTimer = null;
  var _clarifyHealthTimer = null;
  let _clarifyFallbackPollInFlight = false;
@@ -976,7 +976,6 @@ index a13d7acc5..c9b100dfb 100644
 +    _showVaultCardImpl(pending);
 +  } catch (e) {
 +    console.error('[vault] showVaultCard failed', e && e.stack || e);
-+    if (typeof showToast === 'function') showToast('[vault-debug] ERROR: ' + String(e && e.message || e).slice(0, 160), 6000);
 +  }
 +}
 +
@@ -984,11 +983,7 @@ index a13d7acc5..c9b100dfb 100644
 +  if (!pending) return;
 +  const sid = pending.session_id || (S.session && S.session.session_id) || '';
 +  if (typeof _notifyPromptCard === 'function') _notifyPromptCard('vault', sid, pending);
-+  if (!_vaultBelongsToActiveSession(sid)) {
-+    console.error('[vault] showVaultCard skip: session mismatch', sid, 'active:', _promptActiveSessionId());
-+    if (typeof showToast === 'function') showToast('[vault-debug] skip: session mismatch ' + sid + ' vs ' + _promptActiveSessionId(), 4000);
-+    return;
-+  }
++  if (!_vaultBelongsToActiveSession(sid)) return;
 +  const card = _ensureVaultCardDom();
 +  if (!card) return;
 +  const kind = String(pending.kind || 'unlock');
@@ -1037,7 +1032,6 @@ index a13d7acc5..c9b100dfb 100644
 +      fields.innerHTML = '';
 +      fields.appendChild(wrap);
 +    }
-+    if (ident) ident.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); respondVault(); } };
 +  } else if (kind === 'code') {
 +    if (headingEl) headingEl.setAttribute('data-i18n', 'vault_heading_code');
 +    if (headingEl) headingEl.textContent = t('vault_heading_code') || 'Code needed';
@@ -1157,7 +1151,7 @@ index a13d7acc5..c9b100dfb 100644
  let _clarifyPollingSessionId = null;
  let _clarifyProfilePausedSessionId = null;
  
-@@ -10440,6 +10770,8 @@ function _startClarifyFallbackPoll(sid) {
+@@ -10440,6 +10762,8 @@ function _startClarifyFallbackPoll(sid) {
      if (_clarifyFallbackPollInFlight) return;
      _clarifyFallbackPollInFlight = true;
      const focusEpoch = _promptPollerFocusEpoch;
@@ -1166,6 +1160,122 @@ index a13d7acc5..c9b100dfb 100644
      try {
        const generation = _clarifyPromptGeneration(sid);
        const data = await api("/api/clarify/pending?session_id=" + encodeURIComponent(sid),{timeoutToast:false});
+diff --git a/tests/test_vault_card_render.py b/tests/test_vault_card_render.py
+new file mode 100644
+index 000000000..85931a127
+--- /dev/null
++++ b/tests/test_vault_card_render.py
+@@ -0,0 +1,110 @@
++"""Browser vault card rendering: every prompt kind renders without throwing.
++
++Runs the real ``_showVaultCardImpl`` from static/messages.js under Node with a
++minimal DOM stub, so a scoping or reference error in one kind's branch (the
++save-login card once read a block-scoped ``ident`` outside its block) fails
++here instead of silently leaving the agent waiting for an answer that the user
++was never asked for.
++"""
++
++import json
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++
++MESSAGES_JS = Path(__file__).resolve().parent.parent / "static" / "messages.js"
++NODE = shutil.which("node")
++
++
++def _extract_function(source: str, name: str) -> str:
++    marker = f"function {name}("
++    start = source.find(marker)
++    assert start >= 0, f"{name} function not found in static/messages.js"
++    brace = source.find("{", start)
++    depth = 0
++    for idx in range(brace, len(source)):
++        if source[idx] == "{":
++            depth += 1
++        elif source[idx] == "}":
++            depth -= 1
++            if depth == 0:
++                return source[start : idx + 1]
++    raise AssertionError(f"{name} function body not closed")
++
++
++_HARNESS = r"""
++class El {
++  constructor(tag, id) { this.tagName = tag; this.id = id || ''; this.children = []; this.attrs = {};
++    this.value = ''; this._html = ''; this.classList = new Set(); this.classList.contains = this.classList.has; }
++  setAttribute(k, v) { this.attrs[k] = String(v); if (k === 'id') this.id = String(v); }
++  removeAttribute(k) { delete this.attrs[k]; }
++  appendChild(c) { this.children.push(c); registry[c.id] = c; return c; }
++  focus() {}
++  set innerHTML(v) { this._html = v; for (const c of this.children) delete registry[c.id]; this.children = []; }
++  get innerHTML() { return this._html; }
++}
++const registry = {};
++for (const id of ['vaultCard', 'vaultHeading', 'vaultHint', 'vaultQuestion', 'vaultPrimaryInput', 'vaultFields', 'msg'])
++  registry[id] = new El('div', id);
++const document = { createElement: (tag) => new El(tag), activeElement: null };
++const $ = (id) => registry[id] || null;
++const t = (key) => key;
++const S = { session: { session_id: 'sid-1' } };
++let _vaultSessionId = null, _vaultPromptId = null, _vaultKind = null, _vaultSignature = '', _vaultVisibleSince = 0;
++const _notifyPromptCard = () => {};
++const _vaultBelongsToActiveSession = () => true;
++const _ensureVaultCardDom = () => registry.vaultCard;
++const _startVaultCountdown = () => {};
++const _clearVaultCountdownTimer = () => {};
++const _setPromptFlyoutHidden = () => {};
++const _vaultSetControlsDisabled = () => {};
++const respondVault = () => {};
++"""
++
++
++@pytest.mark.skipif(
++    NODE is None, reason="node is required for the vault card render check"
++)
++@pytest.mark.parametrize("kind", ["unlock", "save_login", "code"])
++def test_every_vault_card_kind_renders(kind):
++    impl = _extract_function(
++        MESSAGES_JS.read_text(encoding="utf-8"), "_showVaultCardImpl"
++    )
++    pending = {
++        "kind": kind,
++        "display_name": "1Password",
++        "site": "github.com",
++        "origin": "https://github.com",
++        "label": "GitHub",
++        "prompt_id": f"p-{kind}",
++        "session_id": "sid-1",
++        "timeout_seconds": 120,
++    }
++    script = (
++        _HARNESS
++        + impl
++        + f"""
++_showVaultCardImpl({json.dumps(pending)});
++_showVaultCardImpl({json.dumps(pending)});  // re-render with the fields already present
++console.log(JSON.stringify({{
++  visible: registry.vaultCard.classList.has('visible'),
++  identifier: !!registry.vaultIdentifierInput,
++  primaryType: registry.vaultPrimaryInput.attrs.type || null,
++}}));
++"""
++    )
++    result = subprocess.run(
++        [NODE, "-e", script], capture_output=True, text=True, timeout=30
++    )
++    assert result.returncode == 0, result.stderr
++    state = json.loads(result.stdout.strip().splitlines()[-1])
++    assert state["visible"]
++    assert state["identifier"] is (kind == "save_login")
++    if kind == "unlock":
++        assert state["primaryType"] == "password"
++
++
++def test_vault_card_has_no_debug_toasts():
++    assert "[vault-debug]" not in MESSAGES_JS.read_text(encoding="utf-8")
 diff --git a/tests/test_vault_http.py b/tests/test_vault_http.py
 new file mode 100644
 index 000000000..c2ab4bbc3
